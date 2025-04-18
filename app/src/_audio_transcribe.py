@@ -6,15 +6,15 @@ from sherpa_onnx import OnlineRecognizer
 import time
 from io import BufferedWriter
 # Initialize the recognizer
-# recognizer_en = OnlineRecognizer.from_transducer(
-#     tokens="./models/Kroko-Streaming-ASR-Python/en_tokens.txt",
-#     encoder="./models/Kroko-Streaming-ASR-Python/en_encoder.onnx",
-#     decoder="./models/Kroko-Streaming-ASR-Python/en_decoder.onnx",
-#     joiner="./models/Kroko-Streaming-ASR-Python/en_joiner.onnx",
-#     num_threads=1,
-#     decoding_method="modified_beam_search",
-#     debug=False
-# )
+recognizer_en = OnlineRecognizer.from_transducer(
+    tokens="./models/Kroko-Streaming-ASR-Python/en_tokens.txt",
+    encoder="./models/Kroko-Streaming-ASR-Python/en_encoder.onnx",
+    decoder="./models/Kroko-Streaming-ASR-Python/en_decoder.onnx",
+    joiner="./models/Kroko-Streaming-ASR-Python/en_joiner.onnx",
+    num_threads=1,
+    decoding_method="modified_beam_search",
+    debug=False
+)
 
 
 def transcribe_audio_online_streaming(recognizer: OnlineRecognizer, file: BufferedWriter):
@@ -150,22 +150,22 @@ if __name__ == "__main__":
     from pyaudio import PyAudio, paInt16
 
     p = PyAudio()
-    print(p.get_default_input_device_info())
+    # print(p.get_default_input_device_info())
     stream = p.open(
         format=paInt16,
         channels=1,
         rate=16000,
         input=True,
-        frames_per_buffer=1024,
+        frames_per_buffer=1624,
     )
 
     while True:
-        data = stream.read(1024)
+        data = stream.read(1624)
         audio_chunk = (
             16000,
             np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0,
         )
-        text, stream_state = transcribe_microphone_stream(
+        text, stream_state = transcribe_microphone_stream( recognizer_en,
             audio_chunk, stream_state, "English"
         )
         print(text, stream_state)

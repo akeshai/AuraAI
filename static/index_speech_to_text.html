@@ -187,7 +187,8 @@
         async function startRecording() {
             try {
                 // Initialize audio context
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                // Set frequency of input audio to 16000
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 41000 });
                 
                 // Get microphone access
                 mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
