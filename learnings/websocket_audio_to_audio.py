@@ -50,6 +50,7 @@ class AudioBridge:
                 for conn in self.active_connections:
                     if conn != websocket:
                         self.output_queues[conn].put(processed)
+                        
         except WebSocketDisconnect:
             await self.unregister(websocket)
 
