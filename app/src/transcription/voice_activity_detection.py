@@ -104,6 +104,8 @@ import torch
 
 VAD_LEVEL: int = 3
 vad = webrtcvad.Vad(VAD_LEVEL)
+VAD_SAMPLE_RATE = 16000
+FRAME_DURATION = 5    # ms
 
 def detect_speech_in_chunk(chunk: bytes, sample_rate: int = 16000) -> bool:
     """
@@ -115,44 +117,52 @@ def detect_speech_in_chunk(chunk: bytes, sample_rate: int = 16000) -> bool:
     Returns:
         bool: True if speech detected, False otherwise
     """
-    try:
-        # Convert bytes to numpy array (16-bit PCM)
-        audio_np = np.frombuffer(chunk, dtype=np.int16)
-        
-        # Convert to float32 for resampling
-        audio_tensor = torch.from_numpy(audio_np).float()
-        
-        # Resample if needed
-        if sample_rate != 16000:
-            audio_tensor = audio_tensor.unsqueeze(0)  # Add batch dimension
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sample_rate, 
-                new_freq=16000
-            )
-            audio_tensor = resampler(audio_tensor)
-            audio_tensor = audio_tensor.squeeze(0)  # Remove batch dimension
-            sample_rate = 16000
-        
-        # Convert back to int16 for VAD
-        audio_np = audio_tensor.numpy().astype(np.int16)
-        
-        # Frame parameters for VAD
-        frame_duration = 10  # ms
-        frame_size = int(sample_rate * frame_duration / 1000)
-        
-        # Check if we have enough data
-        if len(audio_np) < frame_size:
-            return False
-            
-        # Take the first frame (or you could process multiple frames)
-        frame = audio_np[:frame_size].tobytes()
-        
-        return vad.is_speech(frame, sample_rate)
-        
-    except Exception as e:
-        print(f"Error detecting speech: {e}")
+    # try:
+    # Convert bytes to numpy array (16-bit PCM)
+    audio_np = np.frombuffer(chunk, dtype=np.int16)
+    
+    # Convert to float32 for resampling
+    audio_tensor = torch.from_numpy(audio_np).float()
+    
+    # Resample if needed
+    if sample_rate != 16000:
+        audio_tensor = audio_tensor.unsqueeze(0)  # Add batch dimension
+        resampler = torchaudio.transforms.Resample(
+            orig_freq=sample_rate, 
+            new_freq=16000
+        )
+        audio_tensor = resampler(audio_tensor)
+        audio_tensor = audio_tensor.squeeze(0)  # Remove batch dimension
+        sample_rate = 16000
+    
+    # Convert back to int16 for VAD
+    audio_np = audio_tensor.numpy().astype(np.int16)
+    
+    # Frame parameters for VAD
+    frame_duration = 30 # ms
+    frame_size = int(sample_rate * frame_duration / 1000)
+    
+    print("Frame size:", frame_size)
+    # Check if we have enough data
+    # print("Length of audio_np/Frame size", len(audio_np))
+    if len(audio_np) < frame_size:
         return False
+        
+    # Take the first frame (or you could process multiple frames)
+    print("Current audio size:", len(audio_np))
+    frame = audio_np[:frame_size].tobytes()
+    # frame = audio_np.tobytes()
+    
+    return vad.is_speech(frame, sample_rate)
+    
+    # except Exception as e:
+    #     # Complete Error handling here if needed. For now, just print the error and return False.
+    #     print(f"Error detecting speech: {e} ")
+    #     return False
+    
+    
 
+    
 if __name__ == "__main__":
     sample_rate = 44100  # Try with both 44100 and 16000
     frame_duration = 30  # ms - using slightly longer frame for better reliability

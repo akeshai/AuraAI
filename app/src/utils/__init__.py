@@ -1,1 +1,2 @@
 from .audio_managers import bytes_to_audio
+from .audio_managers import get_normalized_audio_energy

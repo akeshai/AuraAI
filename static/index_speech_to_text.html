@@ -146,6 +146,15 @@
                         } else if (data.type === 'llm_response') {
                             llmResponseElement.textContent = data.text;
                         }
+                        else if (data.type === 'status'){
+                            statusElement.textContent = 'Status: ' + data.text;
+                            if (data.text === "Listening...") {
+                                statusElement.className = 'status processing';
+                            }
+                            else{
+                                statusElement.className = 'status active';
+                            }
+                        }
                     } catch (e) {
                         console.error('Error parsing message:', e);
                     }
@@ -188,7 +197,8 @@
             try {
                 // Initialize audio context
                 // Set frequency of input audio to 16000
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 41000 });
+                // set frames per/sec to 4096
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
                 
                 // Get microphone access
                 mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -217,7 +227,7 @@
                 processor.connect(audioContext.destination);
                 
                 isRecording = true;
-                statusElement.textContent = 'Status: Recording...';
+                statusElement.textContent = 'Status: Listening...';
                 statusElement.className = 'status processing';
                 
             } catch (error) {
