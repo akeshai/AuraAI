@@ -34,8 +34,8 @@ The TedX Youtube channel hosts over 90,000 videos, with new additions daily.
 generator = pipeline(
     text,
     voice="af_heart",
-    #  split_pattern=r"(?:\r?\n)|(?<=\.)\s+(?=[A-Z])"
-    split_pattern=None,
+     split_pattern=r"(?:\r?\n)|(?<=\.)\s+(?=[A-Z])",
+    # split_pattern=None,
 )
 for i, (gs, ps, audio) in enumerate(generator):
     print(i, gs, ps)
