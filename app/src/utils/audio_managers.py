@@ -1,6 +1,8 @@
+import numpy as np
+from scipy import signal
 
 import numpy as np
-
+import time
 def bytes_to_audio(buffer: bytes, sample_rate: int = 16000) -> (np.ndarray, int):
     """Convert bytes to numpy array of floats 
     returns tuple of (np.ndarray of audio, sample_rate)"""
@@ -48,7 +50,6 @@ def get_normalized_audio_energy(chunk: bytes, dtype=np.int16) -> float:
         print(f"Error computing energy: {e}")
         return 0.0
 
-
 if __name__ == "__main__":
      import pandas as pd
      import time
@@ -62,7 +63,11 @@ if __name__ == "__main__":
    
      # Audio setup
      pya = PyAudio()
-     stream = pya.open(format=paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1624)
+     print(pya.get_default_input_device_info())
+    #  exit()
+    #  pya.get_device_info_by_index()
+    
+     stream = pya.open(format=paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1624,input_device_index=3)
 
      # Tracking variables
      records = []

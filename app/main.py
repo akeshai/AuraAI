@@ -27,7 +27,7 @@ from src.configs import conversation_gen_model
 
 
 # Logging setup
-logging.basicConfig(level=logging.INFO,filename='app.log',format='%(asctime)s - %(levelname)s - %(message)s - %(lineno)d - %(funcName)s')
+logging.basicConfig(level=logging.INFO,format='%(asctime)s - %(levelname)s - %(message)s - %(lineno)d - %(funcName)s')
 logger = logging.getLogger(__name__)
 
 # FastAPI app setup
@@ -54,9 +54,11 @@ async def load_asr_model():
             encoder="./models/Kroko-Streaming-ASR-Python/en_encoder.onnx",
             decoder="./models/Kroko-Streaming-ASR-Python/en_decoder.onnx",
             joiner="./models/Kroko-Streaming-ASR-Python/en_joiner.onnx",
-            num_threads=4,
+            num_threads=5,
             decoding_method="modified_beam_search",
             debug=False,
+            # device='0',
+            # provider="cuda"
         )
     except Exception as e:
         logger.error(f"Failed to load ASR model: {e}")
@@ -67,10 +69,10 @@ async def load_tts_model():
     """Load the TTS model in memory"""
     global pipeline
     model = KModel(
-        config=r"C:\Users\akliv\OneDrive\Desktop\Akesh kumar\forks\Audio2Audio\models\Kroko-82M\config.json",
-        model=r"C:\Users\akliv\OneDrive\Desktop\Akesh kumar\forks\Audio2Audio\models\Kroko-82M\kokoro-v1_0.pth",
+        config="./models/Kroko-82M/config.json",
+        model="./models/Kroko-82M/kokoro-v1_0.pth",
     )
-    pipeline = KPipeline(lang_code="a", model=model)
+    pipeline = KPipeline(lang_code="a", model=model,device = 'cuda')
 
 
 @app.on_event("startup")
@@ -119,9 +121,9 @@ async def websocket_audio_endpoint(websocket: WebSocket):
     user_is_speaking = False
     silence_chunk_count = 0
     speaking_chunk_count = 0
-    min_allowed_speaking = 40
+    min_allowed_speaking = 30
     max_allowed_silence = 10 # 
-    AUDIO_ENERGY_SPEAKING_THRESHOLD = 0.008
+    AUDIO_ENERGY_SPEAKING_THRESHOLD = 0.07
     is_responded = False
     stream_context = None
     
@@ -132,7 +134,7 @@ async def websocket_audio_endpoint(websocket: WebSocket):
             audio_energy = get_normalized_audio_energy(raw_audio)
             speech_detected = detect_speech_in_chunk(raw_audio, sample_rate=44100)
 
-            # logger.info(f"Silence frames: {silence_chunk_count}, Audio energy: {audio_energy}, Speaking: {speech_detected}")
+            logger.info(f"Silence frames: {silence_chunk_count}, Audio energy: {audio_energy}, Speaking: {speech_detected}")
 
             if speech_detected:
                 is_responded = False
@@ -160,7 +162,7 @@ async def websocket_audio_endpoint(websocket: WebSocket):
                         stream_context,
                         websocket,
                     )
-                    if transcription is None or transcription == "":
+                    if transcription is None or transcription == ""  or len(transcription) < 12:
                         manager.send_message(websocket, "status", "Listening...")
                         continue
 

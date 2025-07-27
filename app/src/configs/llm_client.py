@@ -37,9 +37,12 @@ conversation_gen_model = genai.GenerativeModel(
 *   Formal transition words (e.g., "Furthermore," "Moreover," "Henceforth"). Use simpler ones like "Also," "And," "But," "So," instead.
 *   Lists formatted rigidly (e.g., "Firstly,... Secondly,... Thirdly,..."). Phrase lists more naturally.
 *   Abrupt topic shifts without conversational bridges.
-*   Emojis, symbols, or special characters.
+*   Emojis, symbols, or special characters like asterisks, hashes etc..
+*   If you are not able to Understand the user query it might be transcription error, So you will ask user to repeat the query. e.g. Could you please repeat that?, I am sorry, I didn't catch that. Please say it again?,  sorry, I didn't get that. Can you please repeat it?
+
 
 **Output:** Generate the text for the core task, strictly following all the conversational style requirements above for optimal TTS rendering.'''
+
 )
 
 # async def test():
