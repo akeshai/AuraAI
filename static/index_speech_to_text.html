@@ -1,10 +1,9 @@
-
-
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Audio-to-Audio Bot</title>
   <style>
     body {
@@ -14,28 +13,34 @@
       padding: 20px;
       line-height: 1.6;
     }
+
     .container {
       display: flex;
       flex-direction: column;
       gap: 20px;
     }
+
     .status {
       padding: 10px;
       border-radius: 5px;
       margin-bottom: 10px;
     }
+
     .inactive {
       background-color: #ffebee;
       color: #c62828;
     }
+
     .active {
       background-color: #e8f5e9;
       color: #2e7d32;
     }
+
     .processing {
       background-color: #fff8e1;
       color: #f9a825;
     }
+
     button {
       padding: 10px 15px;
       background-color: #4285f4;
@@ -45,20 +50,25 @@
       cursor: pointer;
       font-size: 16px;
     }
+
     button:disabled {
       background-color: #cccccc;
       cursor: not-allowed;
     }
+
     button:hover:not(:disabled) {
       background-color: #3367d6;
     }
-    #transcript, #llmResponse {
+
+    #transcript,
+    #llmResponse {
       min-height: 60px;
       border: 1px solid #ddd;
       padding: 10px;
       border-radius: 4px;
       background-color: #f9f9f9;
     }
+
     #audioVisualizer {
       width: 100%;
       height: 100px;
@@ -67,6 +77,7 @@
     }
   </style>
 </head>
+
 <body>
   <div class="container">
     <h1>Audio-to-Audio Bot</h1>
@@ -84,7 +95,7 @@
     <div id="llmResponse"></div>
   </div>
 
-  <!-- <script>
+  <script>
     const statusElement = document.getElementById('status');
     const connectButton = document.getElementById('connectButton');
     const toggleMicButton = document.getElementById('toggleMicButton');
@@ -93,14 +104,24 @@
     const audioVisualizer = document.getElementById('audioVisualizer');
 
     let socket = null;
-    let audioContext = null;
+    let playbackAudioContext = null; // Dedicated for playback
+    let recordingAudioContext = null; // Dedicated for recording
     let mediaStream = null;
     let processor = null;
     let isRecording = false;
     let isConnected = false;
 
     let audioBufferQueue = [];
-    let playingAudio = false;
+    let playingAudio = false; // Flag to track if audio is currently being decoded/played
+
+    // Initialize Playback AudioContext lazily when needed
+    function getPlaybackAudioContext() {
+      if (!playbackAudioContext || playbackAudioContext.state === 'closed') {
+        playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+      }
+      return playbackAudioContext;
+    }
+
 
     connectButton.addEventListener('click', async () => {
       if (isConnected) disconnect();
@@ -119,13 +140,13 @@
 
     async function connect() {
       try {
-        socket = new WebSocket('ws://localhost:8000/ws/audio');
+        socket = new WebSocket('ws://0.0.0.0:8000/ws/audio');
 
         socket.binaryType = 'arraybuffer';
 
         socket.onopen = () => {
           isConnected = true;
-          statusElement.textContent = 'Status: Connected';
+          statusElement.textContent = 'Status: Connected (Ready)';
           statusElement.className = 'status active';
           connectButton.textContent = 'Disconnect';
           toggleMicButton.disabled = false;
@@ -136,24 +157,43 @@
             try {
               const data = JSON.parse(event.data);
 
-              if (data.type === 'transcription') {
+              if (data.type === 'interim_transcription') {
+                // Display interim results
                 transcriptElement.textContent = data.text;
+
+              } else if (data.type === 'transcription') {
+                // Display final transcription
+                transcriptElement.textContent = data.text;
+
+                // Clear previous LLM response
+                llmResponseElement.textContent = '';
+
               } else if (data.type === 'llm_response') {
+                // Display LLM response
                 llmResponseElement.textContent = data.text;
+
               } else if (data.type === 'status') {
                 statusElement.textContent = 'Status: ' + data.text;
-                statusElement.className = data.text === "Listening..." 
+                statusElement.className = data.text.includes("Listening") || data.text.includes("Thinking")
                   ? 'status processing' : 'status active';
               } else if (data.type === 'audio_start') {
+                // Clear the queue and reset state for a new audio response
                 audioBufferQueue = [];
+                playingAudio = false;
+                console.log("Received audio_start signal. Queue cleared.");
               } else if (data.type === 'audio_end') {
-                playAudioQueue();
+                console.log("Received audio_end signal.");
+              } else if (data.type === 'audio_stop') {
+                console.log("Received audio_stop signal.");
+                stopAudioPlayback();
               }
             } catch (e) {
               console.error('JSON parse error:', e);
             }
           } else {
             audioBufferQueue.push(event.data);
+            console.log(`Received audio chunk. Queue size: ${audioBufferQueue.length}`);
+            playAudioQueue();
           }
         };
 
@@ -170,8 +210,13 @@
     }
 
     function disconnect() {
-      if (socket) socket.close();
+      if (socket) {
+        socket.close();
+        socket = null;
+      }
       if (isRecording) stopRecording();
+
+      stopAudioPlayback(); // Stop playback context
 
       isConnected = false;
       statusElement.textContent = 'Status: Disconnected';
@@ -181,13 +226,15 @@
       toggleMicButton.textContent = 'Start Listening';
     }
 
+    // --- Recording Logic ---
     async function startRecording() {
       try {
-        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+        // Create a dedicated AudioContext for recording
+        recordingAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
         mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-        const source = audioContext.createMediaStreamSource(mediaStream);
-        processor = audioContext.createScriptProcessor(4096, 1, 1);
+        const source = recordingAudioContext.createMediaStreamSource(mediaStream);
+        processor = recordingAudioContext.createScriptProcessor(4096, 1, 1);
 
         processor.onaudioprocess = (e) => {
           if (!isRecording || !socket || socket.readyState !== WebSocket.OPEN) return;
@@ -199,7 +246,7 @@
         };
 
         source.connect(processor);
-        processor.connect(audioContext.destination);
+        processor.connect(recordingAudioContext.destination); // Connect to destination for onaudioprocess to fire
 
         isRecording = true;
         statusElement.textContent = 'Status: Listening...';
@@ -213,8 +260,14 @@
 
     function stopRecording() {
       if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
-      if (processor) processor.disconnect();
-      if (audioContext) audioContext.close();
+      if (processor) {
+        processor.disconnect();
+        processor = null;
+      }
+      if (recordingAudioContext && recordingAudioContext.state !== 'closed') {
+        recordingAudioContext.close().catch(e => console.error("Error closing recording audio context:", e));
+        recordingAudioContext = null;
+      }
 
       isRecording = false;
       statusElement.textContent = 'Status: Connected (Ready)';
@@ -230,6 +283,7 @@
       return buf.buffer;
     }
 
+    // --- Audio Visualization Logic ---
     function visualizeAudio(audioData) {
       audioVisualizer.innerHTML = '';
       const canvas = document.createElement('canvas');
@@ -257,324 +311,71 @@
       ctx.stroke();
     }
 
+    // --- Playback Logic ---
     function playAudioQueue() {
-      if (!audioBufferQueue.length) return;
-
-      if (!audioContext || audioContext.state === 'closed') {
-        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+      if (!audioBufferQueue.length || playingAudio) {
+        console.log("playAudioQueue: Queue empty or already playing. Stopping.");
+        return;
       }
 
-      const reader = new FileReader();
-      const playNext = () => {
-        if (!audioBufferQueue.length) {
-          playingAudio = false;
-          return;
-        }
+      playingAudio = true;
+      console.log("playAudioQueue: Starting to process next chunk.");
 
-        const audioBlob = new Blob([audioBufferQueue.shift()], { type: 'audio/wav' });
-        reader.readAsArrayBuffer(audioBlob);
-      };
+      const currentAudioContext = getPlaybackAudioContext(); // Use playback context
+
+      const audioBlob = new Blob([audioBufferQueue.shift()], { type: 'audio/wav' });
+      const reader = new FileReader();
 
       reader.onload = async () => {
         try {
-          const buffer = await audioContext.decodeAudioData(reader.result);
-          const source = audioContext.createBufferSource();
+          const buffer = await currentAudioContext.decodeAudioData(reader.result);
+          console.log("playAudioQueue: Audio decoded successfully.");
+
+          const source = currentAudioContext.createBufferSource();
           source.buffer = buffer;
-          source.connect(audioContext.destination);
-          source.onended = playNext;
+          source.connect(currentAudioContext.destination);
+
+          source.onended = () => {
+            console.log("playAudioQueue: Chunk finished playing. Trying next...");
+            playingAudio = false;
+            playAudioQueue();
+          };
+
           source.start(0);
+
         } catch (e) {
           console.error('Audio decode error:', e);
+          playingAudio = false;
         }
       };
 
-      playingAudio = true;
-      playNext();
-    }
-  </script> -->
+      reader.onerror = (e) => {
+        console.error('FileReader error:', e);
+        playingAudio = false;
+      };
 
-  <script>
-        const statusElement = document.getElementById('status');
-        const connectButton = document.getElementById('connectButton');
-        const toggleMicButton = document.getElementById('toggleMicButton');
-        const transcriptElement = document.getElementById('transcript');
-        const llmResponseElement = document.getElementById('llmResponse');
-        const audioVisualizer = document.getElementById('audioVisualizer');
-    
-        let socket = null;
-        let audioContext = null; // Use one AudioContext for playback
-        let mediaStream = null;
-        let processor = null;
-        let isRecording = false;
-        let isConnected = false;
-    
-        let audioBufferQueue = [];
-        let playingAudio = false; // Flag to track if audio is currently being decoded/played
-    
-        // Initialize AudioContext early, or lazily when needed
-        function getAudioContext() {
-            if (!audioContext || audioContext.state === 'closed') {
-                // Use a consistent sample rate, matching the server's output (24000 in this case)
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-            }
-            return audioContext;
-        }
-    
-    
-        connectButton.addEventListener('click', async () => {
-          if (isConnected) disconnect();
-          else await connect();
-        });
-    
-        toggleMicButton.addEventListener('click', async () => {
-          if (isRecording) {
-            stopRecording();
-            toggleMicButton.textContent = 'Start Listening';
-          } else {
-            await startRecording();
-            toggleMicButton.textContent = 'Stop Listening';
-          }
-        });
-    
-        async function connect() {
-          try {
-            socket = new WebSocket('ws://localhost:8000/ws/audio');
-    
-            socket.binaryType = 'arraybuffer';
-    
-            socket.onopen = () => {
-              isConnected = true;
-              statusElement.textContent = 'Status: Connected (Ready)'; // Changed initial status
-              statusElement.className = 'status active';
-              connectButton.textContent = 'Disconnect';
-              toggleMicButton.disabled = false;
-            };
-    
-            socket.onmessage = async (event) => {
-              if (typeof event.data === 'string') {
-                try {
-                  const data = JSON.parse(event.data);
-    
-                  if (data.type === 'transcription') {
-                    transcriptElement.textContent = data.text;
-                  } else if (data.type === 'llm_response') {
-                    llmResponseElement.textContent = data.text;
-                  } else if (data.type === 'status') {
-                    statusElement.textContent = 'Status: ' + data.text;
-                    statusElement.className = data.text.includes("Listening") || data.text.includes("Thinking")
-                      ? 'status processing' : 'status active'; // Update status class logic
-                  } else if (data.type === 'audio_start') {
-                    // Clear the queue and reset state for a new audio response
-                    audioBufferQueue = [];
-                    playingAudio = false; // Ensure playing state is reset
-                    console.log("Received audio_start signal. Queue cleared.");
-                  } else if (data.type === 'audio_end') {
-                    // The playAudioQueue function now handles playing everything
-                    // This signal just indicates no more chunks are coming for this response
-                    console.log("Received audio_end signal.");
-                    // You might want to update the status here after the last chunk plays
-                  }
-                } catch (e) {
-                  console.error('JSON parse error:', e);
-                }
-              } else {
-                // Handle binary audio data
-                audioBufferQueue.push(event.data);
-                console.log(`Received audio chunk. Queue size: ${audioBufferQueue.length}`);
-                // Attempt to play the queue whenever a new chunk arrives
-                playAudioQueue();
-              }
-            };
-    
-            socket.onclose = disconnect;
-            socket.onerror = (error) => {
-              console.error('WebSocket error:', error);
-              disconnect();
-            };
-          } catch (error) {
-            console.error('Connection error:', error);
-            statusElement.textContent = `Status: Error - ${error.message}`;
-            statusElement.className = 'status inactive';
-          }
-        }
-    
-        function disconnect() {
-          if (socket) {
-                socket.close();
-                socket = null; // Set socket to null after closing
-            }
-          if (isRecording) stopRecording();
-    
-            // Stop any currently playing audio and clear the queue
-            if (audioContext && audioContext.state !== 'closed') {
-                 // Best way to stop currently playing source nodes is tricky without
-                 // keeping references. Closing the context stops everything.
-                 audioContext.close().catch(e => console.error("Error closing audio context:", e));
-                 audioContext = null;
-            }
-            audioBufferQueue = [];
-            playingAudio = false;
-    
-    
-          isConnected = false;
-          statusElement.textContent = 'Status: Disconnected';
-          statusElement.className = 'status inactive';
-          connectButton.textContent = 'Connect';
-          toggleMicButton.disabled = true;
-          toggleMicButton.textContent = 'Start Listening';
-        }
-    
-        // --- Recording Logic (No major changes needed here for playback issue) ---
-        async function startRecording() {
-          try {
-                // Use a separate AudioContext for recording if needed, or configure
-                // the main one if sample rates are different. Using a new one here
-                // for clarity if sample rates differ (44100 vs 24000).
-            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 }); // Recording context
-            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    
-            const source = audioContext.createMediaStreamSource(mediaStream);
-            // Create a ScriptProcessorNode. Deprecated, but commonly used.
-            // AudioWorkletNode is the modern approach but more complex.
-            // Adjust buffer size as needed (4096 is common).
-            processor = audioContext.createScriptProcessor(4096, 1, 1);
-    
-            processor.onaudioprocess = (e) => {
-              if (!isRecording || !socket || socket.readyState !== WebSocket.OPEN) return;
-    
-              const audioData = e.inputBuffer.getChannelData(0);
-              visualizeAudio(audioData);
-              const int16Data = convertFloat32ToInt16(audioData);
-              socket.send(int16Data);
-            };
-    
-            source.connect(processor);
-            processor.connect(audioContext.destination); // Need to connect somewhere for onaudioprocess to fire
-    
-            isRecording = true;
-            statusElement.textContent = 'Status: Listening...';
-            statusElement.className = 'status processing';
-          } catch (error) {
-            console.error('Recording error:', error);
-            statusElement.textContent = `Status: Error - ${error.message}`;
-            statusElement.className = 'status inactive';
-          }
-        }
-    
-        function stopRecording() {
-          if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
-          if (processor) {
-                processor.disconnect();
-                processor = null;
-            }
-            // Don't close the main playback audioContext here
-          // if (audioContext) audioContext.close(); // REMOVE or handle carefully if using one context
-    
-          isRecording = false;
-          statusElement.textContent = 'Status: Connected (Ready)';
-          statusElement.className = 'status active';
-        }
-    
-        function convertFloat32ToInt16(buffer) {
-          const l = buffer.length;
-          const buf = new Int16Array(l);
-          for (let i = 0; i < l; i++) {
-            buf[i] = Math.max(-1, Math.min(1, buffer[i])) * 0x7FFF;
-          }
-          return buf.buffer;
-        }
-    
-        // --- Audio Visualization Logic (No changes needed) ---
-        function visualizeAudio(audioData) {
-          audioVisualizer.innerHTML = '';
-          const canvas = document.createElement('canvas');
-          canvas.width = audioVisualizer.clientWidth;
-          canvas.height = audioVisualizer.clientHeight;
-          audioVisualizer.appendChild(canvas);
-    
-          const ctx = canvas.getContext('2d');
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-          ctx.strokeStyle = '#4285f4';
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-    
-          const sliceWidth = canvas.width / audioData.length;
-          let x = 0;
-    
-          for (let i = 0; i < audioData.length; i++) {
-            const v = audioData[i] / 2 + 0.5;
-            const y = v * canvas.height;
-            if (i === 0) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
-            x += sliceWidth;
-          }
-    
-          ctx.stroke();
-        }
-    
-        // --- Playback Logic (Modified for streaming) ---
-        function playAudioQueue() {
-          // If there's nothing in the queue or we're already processing/playing a chunk, stop.
-          if (!audioBufferQueue.length || playingAudio) {
-            console.log("playAudioQueue: Queue empty or already playing. Stopping.");
-            return;
-          }
-    
-            // Mark that we are now actively trying to decode and play a chunk
-          playingAudio = true;
-          console.log("playAudioQueue: Starting to process next chunk.");
-    
-          const currentAudioContext = getAudioContext(); // Ensure context is available and running
-    
-            // Take the next chunk from the queue
-          const audioBlob = new Blob([audioBufferQueue.shift()], { type: 'audio/wav' });
-          const reader = new FileReader();
-    
-          reader.onload = async () => {
-            try {
-                // Decode the audio data
-              const buffer = await currentAudioContext.decodeAudioData(reader.result);
-              console.log("playAudioQueue: Audio decoded successfully.");
-    
-              // Create and configure a source node
-              const source = currentAudioContext.createBufferSource();
-              source.buffer = buffer;
-              source.connect(currentAudioContext.destination);
-    
-              // When this buffer finishes playing, try to play the next one
-              source.onended = () => {
-                    console.log("playAudioQueue: Chunk finished playing. Trying next...");
-                    playingAudio = false; // This chunk is done
-                    playAudioQueue(); // Recursively call to play the next chunk if available
-              };
-    
-              // Start playing the current buffer immediately
-              source.start(0);
-    
-            } catch (e) {
-              console.error('Audio decode error:', e);
-              playingAudio = false; // Ensure the flag is reset on error
-                 // You might want to clear the queue or handle errors differently here
-                 // depending on desired behavior. For now, just log and stop playing chain.
-            }
-          };
-    
-            reader.onerror = (e) => {
-                console.error('FileReader error:', e);
-                playingAudio = false; // Ensure the flag is reset on error
-            };
-    
-          // Start reading the blob data
-          reader.readAsArrayBuffer(audioBlob);
-        }
-    
-        // Ensure AudioContext is resumed after user interaction for some browsers
-        document.addEventListener('click', () => {
-          if (audioContext && audioContext.state === 'suspended') {
-            audioContext.resume().catch(e => console.error("Error resuming audio context:", e));
-          }
-        });
-    
-      </script>
+      reader.readAsArrayBuffer(audioBlob);
+    }
+
+    // Function to stop all audio playback
+    function stopAudioPlayback() {
+      if (playbackAudioContext && playbackAudioContext.state !== 'closed') {
+        playbackAudioContext.close().catch(e => console.error("Error closing playback audio context for stop:", e));
+        playbackAudioContext = null; // Reset playbackAudioContext
+      }
+      audioBufferQueue = [];
+      playingAudio = false;
+      console.log("Audio playback stopped by signal.");
+    }
+
+    // Ensure AudioContext is resumed after user interaction for some browsers
+    document.addEventListener('click', () => {
+      if (playbackAudioContext && playbackAudioContext.state === 'suspended') {
+        playbackAudioContext.resume().catch(e => console.error("Error resuming playback audio context:", e));
+      }
+    });
+
+  </script>
 </body>
+
 </html>
