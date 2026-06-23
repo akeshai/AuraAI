@@ -929,7 +929,15 @@
     async function startRecording() {
       try {
         recordingAudioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1,
+            sampleRate: 16000
+          }
+        });
 
         const source = recordingAudioContext.createMediaStreamSource(mediaStream);
         recordingAnalyser = recordingAudioContext.createAnalyser();
@@ -953,8 +961,8 @@
           }
           rms = Math.sqrt(rms / floatData.length);
 
-          // Client-side instant barge-in trigger (rms threshold = 0.008)
-          if (rms > 0.008 && isPlayingAudio) {
+          // Client-side instant barge-in trigger (rms threshold = 0.030)
+          if (rms > 0.030 && isPlayingAudio) {
             console.log("Client-side VAD barge-in detected. Stopping output immediately.");
             stopAudioPlayback();
             socket.send(JSON.stringify({ type: 'user_interrupted' }));
