@@ -50,6 +50,8 @@ async def load_asr_model():
             num_threads=5,
             decoding_method="modified_beam_search",
             debug=False,
+            provider="cuda",
+            device=0,
         )
     except Exception as e:
         logger.error(f"Failed to load ASR model: {e}")
@@ -61,7 +63,7 @@ async def load_tts_model():
     model = KModel(
         config="./models/Kroko-82M/config.json",
         model="./models/Kroko-82M/kokoro-v1_0.pth",
-    )
+    ).to('cuda')
     pipeline = KPipeline(lang_code="a", model=model, device='cuda')
 
 @app.on_event("startup")
