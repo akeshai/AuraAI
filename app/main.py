@@ -71,22 +71,82 @@ async def startup_event():
     global manager
     manager = ConnectionManager()
 
-async def send_ai_audio(websocket: WebSocket, text: str, pipeline, manager):
+import re
+
+def extract_sentences(text: str):
+    """
+    Splits text into sentences. Returns a list of complete sentences
+    and the remaining unfinished text.
+    """
+    # Matches sentences ending in ., ?, !, or a newline
+    pattern = re.compile(r'([^.!?\n]+[.!?\n]+)')
+    matches = pattern.findall(text)
+    
+    if not matches:
+        return [], text
+        
+    matched_len = sum(len(m) for m in matches)
+    remainder = text[matched_len:]
+    
+    return [m.strip() for m in matches if m.strip()], remainder
+
+async def generate_and_send_response(websocket: WebSocket, prompt: str, voice: str, pipeline, manager):
     try:
-        generator = pipeline(text, voice="af_heart", split_pattern=r"(?:\r?\n)|(?<=\.)\s+(?=[A-Z])")
         await manager.send_message(websocket, "audio_start", "Audio incoming...")
-        for i, (gs, ps, audio) in enumerate(generator):
-            await asyncio.sleep(0)
-            logger.info(f"Attempting to send audio chunk {i}. Task cancelled: {asyncio.current_task().cancelled()}")
-            buf = io.BytesIO()
-            sf.write(buf, audio, 24000, format='WAV')
-            buf.seek(0)
-            await websocket.send_bytes(buf.read())
+        
+        # Start Gemini API call asynchronously with streaming
+        response = await conversation_gen_model.generate_content_async(prompt, stream=True)
+        
+        text_buffer = ""
+        loop = asyncio.get_running_loop()
+        
+        async for chunk in response:
+            try:
+                if chunk.text:
+                    text_buffer += chunk.text
+                    sentences, text_buffer = extract_sentences(text_buffer)
+                    for sentence in sentences:
+                        logger.info(f"Generated sentence: {sentence}")
+                        await manager.send_message(websocket, "llm_response_chunk", sentence)
+                        
+                        def run_tts(text_to_speak, v_name):
+                            return list(pipeline(text_to_speak, voice=v_name))
+                        
+                        # Generate audio for the sentence in thread pool
+                        tts_results = await loop.run_in_executor(None, run_tts, sentence, voice)
+                        for gs, ps, audio in tts_results:
+                            await asyncio.sleep(0)
+                            buf = io.BytesIO()
+                            sf.write(buf, audio, 24000, format='WAV')
+                            buf.seek(0)
+                            await websocket.send_bytes(buf.read())
+            except Exception as inner_e:
+                logger.error(f"Error processing text chunk: {inner_e}")
+                
+        # Send remaining text
+        if text_buffer.strip():
+            sentence = text_buffer.strip()
+            logger.info(f"Generated final sentence: {sentence}")
+            await manager.send_message(websocket, "llm_response_chunk", sentence)
+            
+            def run_tts(text_to_speak, v_name):
+                return list(pipeline(text_to_speak, voice=v_name))
+                
+            tts_results = await loop.run_in_executor(None, run_tts, sentence, voice)
+            for gs, ps, audio in tts_results:
+                await asyncio.sleep(0)
+                buf = io.BytesIO()
+                sf.write(buf, audio, 24000, format='WAV')
+                buf.seek(0)
+                await websocket.send_bytes(buf.read())
+                
         await manager.send_message(websocket, "audio_end", "Done playing audio")
     except asyncio.CancelledError:
-        logger.info("AI audio task received cancellation signal.")
-        logger.info("AI audio playback was cancelled by user barge-in.")
+        logger.info("AI response streaming task received cancellation signal.")
         await manager.send_message(websocket, "audio_stop", "Playback stopped.")
+    except Exception as e:
+        logger.error(f"Error in generate_and_send_response: {e}")
+        await manager.send_message(websocket, "error", f"Response error: {str(e)}")
 
 @app.websocket("/ws/audio")
 async def websocket_audio_endpoint(websocket: WebSocket):
@@ -96,118 +156,146 @@ async def websocket_audio_endpoint(websocket: WebSocket):
     stream_state = None
     user_is_speaking = False
     silence_chunk_count = 0
-    speaking_chunk_count = 0 # Initialize speaking chunk count
-    max_allowed_silence = 20 # Increased to allow for more natural pauses
-    min_allowed_speaking = 10 # Decreased to allow shorter utterances
-    ai_audio_task = None
+    speaking_chunk_count = 0
+    
+    # Default configs
+    current_voice = "af_heart"
+    max_allowed_silence = 8    # ~1 sec at 128ms per chunk
+    min_allowed_speaking = 3   # ~380ms at 128ms per chunk
+    chunk_duration_ms = 128.0  # assumed 2048 samples at 16kHz
+    audio_energy_speaking_threshold = 0.020
+    
+    ai_response_task = None
 
-    POST_SPEECH_BUFFER_CHUNKS = 10 # Number of chunks to buffer after speech ends
+    POST_SPEECH_BUFFER_CHUNKS = 10
     post_speech_buffer = deque(maxlen=POST_SPEECH_BUFFER_CHUNKS)
 
     try:
         while True:
-            raw_audio = await websocket.receive_bytes()
-            raw_audio = await websocket.receive_bytes()
-            post_speech_buffer.append(raw_audio) # Always append to buffer
-
-            audio_np = np.frombuffer(raw_audio, dtype=np.int16)
+            # We receive websocket message (which can be bytes or text)
+            message = await websocket.receive()
             
-            audio_tensor = torch.from_numpy(audio_np).float()
-            if audio_tensor.ndim > 1:
-                audio_tensor = audio_tensor.mean(axis=1)
-            
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=44100, 
-                new_freq=VAD_SAMPLE_RATE
-            )
-            resampled_audio = resampler(audio_tensor).numpy().astype(np.int16)
-            
-            # VAD framing
-            VAD_FRAME_SIZE_MS = 30 # ms
-            vad_frame_size_samples = int(VAD_SAMPLE_RATE * VAD_FRAME_SIZE_MS / 1000)
-            vad_frame_size_bytes = vad_frame_size_samples * 2 # 2 bytes per sample for int16
-
-            webrtcvad_speech_detected = False
-            # Process audio in VAD-compatible frames
-            for i in range(0, len(resampled_audio) - vad_frame_size_samples + 1, vad_frame_size_samples):
-                vad_frame = resampled_audio[i:i + vad_frame_size_samples]
-                if is_speech(vad_frame.tobytes(), VAD_SAMPLE_RATE):
-                    webrtcvad_speech_detected = True
-                    break
-
-            audio_energy = get_normalized_audio_energy(raw_audio)
-            speech_detected = webrtcvad_speech_detected or (audio_energy > AUDIO_ENERGY_SPEAKING_THRESHOLD)
-
-            if speech_detected:
-                if ai_audio_task and not ai_audio_task.done():
-                    logger.info("Attempting to cancel AI audio task due to user interruption.")
-                    ai_audio_task.cancel()
-                    logger.info(f"AI audio task state after cancel: done={ai_audio_task.done()}, cancelled={ai_audio_task.cancelled()}")
+            if "bytes" in message:
+                raw_audio = message["bytes"]
+                post_speech_buffer.append(raw_audio)
                 
-                user_is_speaking = True
-                silence_chunk_count = 0
-                speaking_chunk_count += 1 # Increment speaking chunk count
-                if stream_state is None:
-                    stream_state = recognizer_en.create_stream()
+                audio_np = np.frombuffer(raw_audio, dtype=np.int16)
+                # No resampling needed since client streams 16kHz natively
+                resampled_audio = audio_np
                 
-                audio_np_asr, _ = bytes_to_audio(raw_audio, sample_rate=44100)
-                stream_state.accept_waveform(44100, audio_np_asr.tolist())
-                
-                # Ensure decoding happens for the latest waveform
-                while recognizer_en.is_ready(stream_state):
-                    recognizer_en.decode_streams([stream_state])
-                
-                # Get and send interim text after processing the current chunk
-                interim_text = recognizer_en.get_result(stream_state)
-                if interim_text: # Only send if not empty
-                    logger.debug(f"Sending interim_transcription: {interim_text}")
-                    await manager.send_message(websocket, "interim_transcription", interim_text)
+                # VAD framing
+                VAD_FRAME_SIZE_MS = 30 # ms
+                vad_frame_size_samples = int(VAD_SAMPLE_RATE * VAD_FRAME_SIZE_MS / 1000)
 
-            elif user_is_speaking:
-                logger.debug(f"Silence frames: {silence_chunk_count}, Audio energy: {audio_energy:.4f}, Speaking: {speech_detected}, Speaking chunks: {speaking_chunk_count}")
-                silence_chunk_count += 1
-                if silence_chunk_count > max_allowed_silence:
-                    user_is_speaking = False
-                    # Check if the utterance was long enough
-                    if speaking_chunk_count < min_allowed_speaking:
-                        logger.info(f"Utterance too short ({speaking_chunk_count} chunks). Discarding.")
-                        speaking_chunk_count = 0 # Reset for next utterance
-                        stream_state = None # Reset ASR stream
-                        await manager.send_message(websocket, "status", "Listening... Speak more...")
-                        continue # Skip to next audio chunk
+                webrtcvad_speech_detected = False
+                for i in range(0, len(resampled_audio) - vad_frame_size_samples + 1, vad_frame_size_samples):
+                    vad_frame = resampled_audio[i:i + vad_frame_size_samples]
+                    if is_speech(vad_frame.tobytes(), VAD_SAMPLE_RATE):
+                        webrtcvad_speech_detected = True
+                        break
 
-                    speaking_chunk_count = 0 # Reset for next utterance
-                    if stream_state:
-                        # Feed the post-speech buffer to the ASR stream
-                        for buffered_chunk in post_speech_buffer:
-                            audio_np_asr, _ = bytes_to_audio(buffered_chunk, sample_rate=44100)
-                            stream_state.accept_waveform(44100, audio_np_asr.tolist())
-                        post_speech_buffer.clear() # Clear the buffer after use
+                audio_energy = get_normalized_audio_energy(raw_audio)
+                speech_detected = webrtcvad_speech_detected or (audio_energy > audio_energy_speaking_threshold)
 
-                        stream_state.input_finished()
-                        while recognizer_en.is_ready(stream_state):
-                            recognizer_en.decode_streams([stream_state])
+                if speech_detected:
+                    # User is speaking. If AI is speaking/generating, cancel it immediately (barge-in)!
+                    if ai_response_task and not ai_response_task.done():
+                        logger.info("Cancelling AI response task due to user speech detection (barge-in).")
+                        ai_response_task.cancel()
+                    
+                    user_is_speaking = True
+                    silence_chunk_count = 0
+                    speaking_chunk_count += 1
+                    
+                    if stream_state is None:
+                        stream_state = recognizer_en.create_stream()
+                    
+                    audio_np_asr, _ = bytes_to_audio(raw_audio, sample_rate=16000)
+                    stream_state.accept_waveform(16000, audio_np_asr.tolist())
+                    
+                    while recognizer_en.is_ready(stream_state):
+                        recognizer_en.decode_streams([stream_state])
+                    
+                    interim_text = recognizer_en.get_result(stream_state)
+                    if interim_text:
+                        await manager.send_message(websocket, "interim_transcription", interim_text)
+
+                elif user_is_speaking:
+                    silence_chunk_count += 1
+                    if silence_chunk_count > max_allowed_silence:
+                        user_is_speaking = False
                         
-                        final_transcription = recognizer_en.get_result(stream_state)
-                        await manager.send_message(websocket, "transcription", final_transcription)
+                        if speaking_chunk_count < min_allowed_speaking:
+                            logger.info(f"Utterance too short ({speaking_chunk_count} chunks). Discarding.")
+                            speaking_chunk_count = 0
+                            stream_state = None
+                            await manager.send_message(websocket, "status", "Listening... Speak more...")
+                            continue
 
-                        if final_transcription:
-                            response_text = ""
-                            response = conversation_gen_model.generate_content(
-                                f"User: {final_transcription}\nAI:", stream=True
-                            )
-                            for data in response:
-                                response_text += data.text
+                        speaking_chunk_count = 0
+                        if stream_state:
+                            # Feed the post-speech buffer to ASR
+                            for buffered_chunk in post_speech_buffer:
+                                audio_np_asr, _ = bytes_to_audio(buffered_chunk, sample_rate=16000)
+                                stream_state.accept_waveform(16000, audio_np_asr.tolist())
+                            post_speech_buffer.clear()
+
+                            stream_state.input_finished()
+                            while recognizer_en.is_ready(stream_state):
+                                recognizer_en.decode_streams([stream_state])
                             
-                            await manager.send_message(websocket, "llm_response", response_text)
-                            ai_audio_task = asyncio.create_task(
-                                send_ai_audio(websocket, response_text, pipeline, manager)
-                            )
-                        stream_state = None
+                            final_transcription = recognizer_en.get_result(stream_state)
+                            await manager.send_message(websocket, "transcription", final_transcription)
 
+                            if final_transcription:
+                                prompt = f"User: {final_transcription}\nAI:"
+                                if ai_response_task and not ai_response_task.done():
+                                    ai_response_task.cancel()
+                                
+                                ai_response_task = asyncio.create_task(
+                                    generate_and_send_response(
+                                        websocket, prompt, current_voice, pipeline, manager
+                                    )
+                                )
+                            stream_state = None
+                            
+            elif "text" in message:
+                try:
+                    data = json.loads(message["text"])
+                    msg_type = data.get("type")
+                    
+                    if msg_type == "user_interrupted":
+                        if ai_response_task and not ai_response_task.done():
+                            logger.info("Cancelling AI response task due to client interruption signal.")
+                            ai_response_task.cancel()
+                            
+                    elif msg_type == "update_settings":
+                        if "voice" in data:
+                            current_voice = data["voice"]
+                            logger.info(f"Updated current voice to: {current_voice}")
+                        if "max_silence_ms" in data:
+                            max_silence_ms = data["max_silence_ms"]
+                            max_allowed_silence = max(1, int(max_silence_ms / chunk_duration_ms))
+                            logger.info(f"Updated max_allowed_silence to {max_allowed_silence} chunks ({max_silence_ms}ms)")
+                        if "min_speaking_ms" in data:
+                            min_speaking_ms = data["min_speaking_ms"]
+                            min_allowed_speaking = max(1, int(min_speaking_ms / chunk_duration_ms))
+                            logger.info(f"Updated min_allowed_speaking to {min_allowed_speaking} chunks ({min_speaking_ms}ms)")
+                        if "energy_threshold" in data:
+                            audio_energy_speaking_threshold = data["energy_threshold"]
+                            logger.info(f"Updated audio_energy_speaking_threshold to {audio_energy_speaking_threshold}")
+                except Exception as text_e:
+                    logger.error(f"Error parsing text message: {text_e}")
+                        
     except WebSocketDisconnect:
         manager.disconnect(websocket)
         logger.info("Client disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket endpoint exception: {e}")
+        try:
+            manager.disconnect(websocket)
+        except Exception:
+            pass
 
 @app.get("/")
 async def get():

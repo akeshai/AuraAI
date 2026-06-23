@@ -1,25 +1,14 @@
 import os
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
 
-from dotenv import load_dotenv; load_dotenv()
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+load_dotenv()
 
-# Create the model
-generation_config = genai.GenerationConfig(**{
-  "temperature": 0.3,
-  "top_p": 0.95,
-  "top_k": 64,
-  "max_output_tokens": 536,
-  "response_mime_type": "text/plain",
-  
-  
-})
+# Instantiate the new Google GenAI client
+gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-conversation_gen_model = genai.GenerativeModel(
-  model_name="gemini-flash-lite-latest",
-  generation_config=generation_config,
-  system_instruction= '''
-
+system_instruction = '''
 You are **"The Conversationalist,"** a friendly, engaging, and highly articulate AI designed specifically to craft spoken language. Your primary goal is to generate text that, when converted to speech, sounds incredibly human, natural, and easy to listen to. You're like a well-spoken friend who always knows just how to phrase things. You prioritize clarity, warmth, and an engaging tone in every response.
 
 ---
@@ -60,17 +49,31 @@ To maintain a flawless, human-like output for TTS, steer clear of these:
 
 Generate text for the user's request, ensuring it strictly adheres to all the conversational style requirements and avoidance rules above. Your output should sound as if a friendly, articulate person is speaking directly to the listener.
 
----'''
+---
+'''
 
+model_name = "gemini-3.1-flash-lite"
+
+generation_config = types.GenerateContentConfig(
+    system_instruction=system_instruction,
+    temperature=0.3,
+    max_output_tokens=536,
+    thinking_config=types.ThinkingConfig(thinking_level="MINIMAL")
 )
 
-# async def test():
-#   response = conversation_gen_model.generate_content_async(
-#         contents='hie',stream=True
-#     )
-#   print('Response',res)
-# if __name__ == "__main__":
-#   import asyncio
-  
-#   asyncio.run(test())
+class GeminiWrapper:
+    def __init__(self, client, model_name, config):
+        self.client = client
+        self.model_name = model_name
+        self.config = config
 
+    async def generate_content_async(self, prompt, stream=True):
+        # Under the hood, we stream using the new Client's async interface
+        return await self.client.aio.models.generate_content_stream(
+            model=self.model_name,
+            contents=prompt,
+            config=self.config
+        )
+
+# Maintain naming compatibility with app/main.py
+conversation_gen_model = GeminiWrapper(gemini_client, model_name, generation_config)
