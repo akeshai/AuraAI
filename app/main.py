@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import io
+import time
 from typing import Optional
 
 import torch
@@ -165,9 +166,10 @@ async def websocket_audio_endpoint(websocket: WebSocket):
     max_allowed_silence = 8    # ~1 sec at 128ms per chunk
     min_allowed_speaking = 3   # ~380ms at 128ms per chunk
     chunk_duration_ms = 128.0  # assumed 2048 samples at 16kHz
-    audio_energy_speaking_threshold = 0.020
+    audio_energy_speaking_threshold = 0.030
     
     ai_response_task = None
+    ai_response_start_time = 0.0
     barge_in_consecutive_chunks = 0
 
     POST_SPEECH_BUFFER_CHUNKS = 10
@@ -191,32 +193,28 @@ async def websocket_audio_endpoint(websocket: WebSocket):
                 vad_frame_size_samples = int(VAD_SAMPLE_RATE * VAD_FRAME_SIZE_MS / 1000)
 
                 webrtcvad_speech_detected = False
+                speech_frames = 0
+                total_frames = 0
                 for i in range(0, len(resampled_audio) - vad_frame_size_samples + 1, vad_frame_size_samples):
                     vad_frame = resampled_audio[i:i + vad_frame_size_samples]
+                    total_frames += 1
                     if is_speech(vad_frame.tobytes(), VAD_SAMPLE_RATE):
-                        webrtcvad_speech_detected = True
-                        break
+                        speech_frames += 1
+                
+                if total_frames > 0 and (speech_frames / total_frames) >= 0.5:
+                    webrtcvad_speech_detected = True
 
                 audio_energy = get_normalized_audio_energy(raw_audio)
                 speech_detected = webrtcvad_speech_detected or (audio_energy > audio_energy_speaking_threshold)
+                
+                # Diagnostic log to see what is keeping the mic active
+                logger.info(f"VAD: {webrtcvad_speech_detected} | Energy: {audio_energy:.4f} (threshold: {audio_energy_speaking_threshold}) | Speech Detected: {speech_detected}")
 
                 if speech_detected:
-                    # User is speaking. If AI is speaking/generating, cancel it immediately (barge-in)!
-                    if ai_response_task and not ai_response_task.done():
-                        # While AI is speaking, be conservative to avoid false barge-ins:
-                        # 1. Require webrtcvad_speech_detected (actual voice frequencies), ignoring energy-only triggers.
-                        # 2. Require consecutive chunks to filter out transient noises/clicks.
-                        if webrtcvad_speech_detected:
-                            barge_in_consecutive_chunks += 1
-                        else:
-                            barge_in_consecutive_chunks = 0
-
-                        if barge_in_consecutive_chunks >= 2:
-                            logger.info(f"Cancelling AI response task due to user speech detection (barge-in). Consecutive chunks: {barge_in_consecutive_chunks}")
-                            ai_response_task.cancel()
-                            barge_in_consecutive_chunks = 0
-                    else:
-                        barge_in_consecutive_chunks = 0
+                    # User is speaking.
+                    # Note: Interruption (barge-in) is controlled by the client-side VAD,
+                    # which sends a "user_interrupted" text message to cancel the task.
+                    # This avoids false triggers due to network jitter or echo on the backend.
                     
                     user_is_speaking = True
                     silence_chunk_count = 0
@@ -274,6 +272,7 @@ async def websocket_audio_endpoint(websocket: WebSocket):
                                             websocket, prompt, current_voice, pipeline, manager
                                         )
                                     )
+                                    ai_response_start_time = time.time()
                                 stream_state = None
                             
             elif "text" in message:

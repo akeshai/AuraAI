@@ -523,6 +523,15 @@
         </select>
       </div>
 
+      <div class="control-group">
+        <label for="bargeInSelect">Voice Interruption (Barge-in)</label>
+        <select id="bargeInSelect">
+          <option value="adaptive">Adaptive Mode (Speakers - Recommended)</option>
+          <option value="sensitive">Sensitive Mode (Headset)</option>
+          <option value="disabled">Tap / Click Orb to Interrupt Only</option>
+        </select>
+      </div>
+
       <div class="section-title" style="margin-top: 10px;">VAD & Sensitivity</div>
       
       <div class="control-group">
@@ -533,6 +542,11 @@
       <div class="control-group">
         <label>Min Speaking Duration <span id="speakingVal" class="control-value">400ms</span></label>
         <input type="range" id="speakingSlider" min="200" max="1000" step="50" value="400" />
+      </div>
+
+      <div class="control-group">
+        <label>Mic Sensitivity <span id="sensitivityVal" class="control-value">0.030</span></label>
+        <input type="range" id="sensitivitySlider" min="0.005" max="0.100" step="0.005" value="0.030" />
       </div>
 
       <div class="control-group">
@@ -608,10 +622,13 @@
     
     // Sliders & settings
     const voiceSelect = document.getElementById('voiceSelect');
+    const bargeInSelect = document.getElementById('bargeInSelect');
     const silenceSlider = document.getElementById('silenceSlider');
     const silenceVal = document.getElementById('silenceVal');
     const speakingSlider = document.getElementById('speakingSlider');
     const speakingVal = document.getElementById('speakingVal');
+    const sensitivitySlider = document.getElementById('sensitivitySlider');
+    const sensitivityVal = document.getElementById('sensitivityVal');
     const volumeSlider = document.getElementById('volumeSlider');
     const volumeVal = document.getElementById('volumeVal');
 
@@ -663,6 +680,10 @@
       speakingVal.textContent = e.target.value + 'ms';
       sendSettings();
     });
+    sensitivitySlider.addEventListener('input', (e) => {
+      sensitivityVal.textContent = e.target.value;
+      sendSettings();
+    });
     volumeSlider.addEventListener('input', (e) => {
       volumeVal.textContent = e.target.value + '%';
       if (gainNode) {
@@ -695,6 +716,31 @@
         micBtn.classList.add('active');
         setOrbState('listening');
       }
+    });
+
+    // Orb click listener: click to interrupt AI or toggle recording
+    orbOuter.addEventListener('click', () => {
+      if (!isConnected) {
+        connectBtn.click();
+        return;
+      }
+      if (isPlayingAudio) {
+        console.log("Orb clicked. Interrupting AI playback manually.");
+        stopAudioPlayback();
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'user_interrupted' }));
+        }
+        if (isRecording) {
+          setOrbState('listening');
+          statusText.textContent = 'Listening...';
+        } else {
+          setOrbState('idle');
+          statusText.textContent = 'Connected (Ready)';
+        }
+        return;
+      }
+      // If AI is not speaking, toggle microphone
+      micBtn.click();
     });
 
     clearChatBtn.addEventListener('click', () => {
@@ -830,7 +876,8 @@
           type: 'update_settings',
           voice: voiceSelect.value,
           max_silence_ms: parseInt(silenceSlider.value),
-          min_speaking_ms: parseInt(speakingSlider.value)
+          min_speaking_ms: parseInt(speakingSlider.value),
+          energy_threshold: parseFloat(sensitivitySlider.value)
         }));
       }
     }
@@ -925,6 +972,23 @@
       nextStartTime = 0;
     }
 
+    // Dynamic playback volume tracking to calibrate adaptive VAD echo thresholding
+    let playbackRmsHistory = [0, 0, 0];
+
+    function getPlaybackRMS() {
+      if (!playbackAnalyser) return 0;
+      const bufferLength = playbackAnalyser.fftSize;
+      const dataArray = new Uint8Array(bufferLength);
+      playbackAnalyser.getByteTimeDomainData(dataArray);
+      
+      let sumSquares = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        const normalizedValue = (dataArray[i] - 128) / 128;
+        sumSquares += normalizedValue * normalizedValue;
+      }
+      return Math.sqrt(sumSquares / bufferLength);
+    }
+
     // Microphone audio capture at 16000Hz natively
     async function startRecording() {
       try {
@@ -933,7 +997,7 @@
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true,
+            autoGainControl: false,
             channelCount: 1,
             sampleRate: 16000
           }
@@ -961,13 +1025,45 @@
           }
           rms = Math.sqrt(rms / floatData.length);
 
-          // Client-side instant barge-in trigger (rms threshold = 0.030)
-          if (rms > 0.030 && isPlayingAudio) {
-            console.log("Client-side VAD barge-in detected. Stopping output immediately.");
-            stopAudioPlayback();
-            socket.send(JSON.stringify({ type: 'user_interrupted' }));
-            setOrbState('listening');
-            statusText.textContent = 'Listening...';
+          const mode = bargeInSelect.value;
+          
+          if (isPlayingAudio) {
+            if (mode === 'disabled') {
+              // Tap to interrupt only: mute mic during playback
+              return;
+            }
+            
+            // Get current playback volume level
+            const currentPlaybackRms = getPlaybackRMS();
+            playbackRmsHistory.push(currentPlaybackRms);
+            if (playbackRmsHistory.length > 3) {
+              playbackRmsHistory.shift();
+            }
+            const maxPlaybackRms = Math.max(...playbackRmsHistory);
+
+            // For adaptive (speakers) and sensitive (headset) voice barge-in modes:
+            const baseThreshold = parseFloat(sensitivitySlider.value) || 0.030;
+            
+            // Dynamically calculate threshold based on the maximum playing volume in the recent window.
+            // Coupling factor of 1.2 matches typical speaker-to-mic feedback ratios.
+            const couplingFactor = 1.2;
+            const activeThreshold = (mode === 'adaptive')
+              ? baseThreshold + (maxPlaybackRms * couplingFactor)
+              : baseThreshold;
+            
+            if (rms > activeThreshold) {
+              console.log(`Barge-in: Mic RMS (${rms.toFixed(4)}) > Threshold (${activeThreshold.toFixed(4)}). Max Playback RMS was ${maxPlaybackRms.toFixed(4)}. Stopping playback.`);
+              stopAudioPlayback();
+              socket.send(JSON.stringify({ type: 'user_interrupted' }));
+              setOrbState('listening');
+              statusText.textContent = 'Listening...';
+            } else {
+              // Echo/noise is below threshold: do not send to server to prevent self-transcription
+              return;
+            }
+          } else {
+            // Reset history when not playing audio
+            playbackRmsHistory = [0, 0, 0];
           }
 
           // Convert float to int16 PCM bytes
