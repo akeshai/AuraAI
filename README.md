@@ -33,12 +33,13 @@ graph TD
 
 ## 🛠️ Prerequisites & Setup
 
-### 1. Requirements
+### 1. General Requirements
 *   Python 3.10+
-*   NVIDIA GPU & CUDA Toolkit (Recommended for accelerated Kokoro TTS)
-*   Web Browser with Microphone access (must run under localhost or HTTPS for Web Audio API permissions)
+*   Web Browser with Microphone access (must run under `localhost` or HTTPS for Web Audio API permissions)
 
-### 2. Installation & GPU Configuration
+---
+
+### 2. Base Installation
 
 1.  **Clone the repository:**
     ```bash
@@ -52,19 +53,12 @@ graph TD
     source .venv/bin/activate
     ```
 
-3.  **Install dependencies:**
+3.  **Install base packages:**
     ```bash
     pip install -r requirements.txt
     ```
 
-4.  **Resolve ONNX GPU Conflicts (Crucial for GPU TTS execution):**
-    Ensure only the GPU version of ONNX Runtime is installed to prevent fallback to CPU:
-    ```bash
-    .venv/bin/pip uninstall -y onnxruntime onnxruntime-gpu
-    .venv/bin/pip install onnxruntime-gpu==1.20.0
-    ```
-
-5.  **Configure environment variables:**
+4.  **Configure environment variables:**
     Copy `.env.example` to `.env` and insert your Gemini API Key:
     ```bash
     cp .env.example .env
@@ -73,15 +67,40 @@ graph TD
 
 ---
 
-## 🚀 Running the Application
+### 3. Execution Modes (Choose Option A or B)
 
-To ensure that the virtualenv python preloads CUDA libraries successfully, launch the application using:
+The application automatically adapts to the execution runtime installed in your virtual environment:
 
-```bash
-PYTHONPATH=app .venv/bin/python -m uvicorn main:app
-```
+#### 🔹 Option A: CPU-Only Mode (Default / Standard Setup)
+Choose this option if you do not have an NVIDIA GPU or do not want to set up CUDA drivers. Kokoro TTS will execute on the CPU.
+1.  **Configure CPU-only ONNX Runtime:**
+    ```bash
+    .venv/bin/pip uninstall -y onnxruntime onnxruntime-gpu
+    .venv/bin/pip install onnxruntime==1.20.0
+    ```
+2.  **Run the Server:**
+    ```bash
+    PYTHONPATH=app .venv/bin/python -m uvicorn main:app
+    ```
 
-Once running, navigate to:
+#### 🔸 Option B: GPU (CUDA) Mode (Accelerated Setup)
+Choose this option to accelerate Kokoro TTS speech synthesis using your NVIDIA GPU, dropping response latency down to **~150ms**.
+1.  **Prerequisites:** NVIDIA GPU with CUDA Toolkit 12.x installed on your host system.
+2.  **Configure GPU-enabled ONNX Runtime:**
+    ```bash
+    .venv/bin/pip uninstall -y onnxruntime onnxruntime-gpu
+    .venv/bin/pip install onnxruntime-gpu==1.20.0
+    ```
+3.  **Run the Server:**
+    ```bash
+    PYTHONPATH=app .venv/bin/python -m uvicorn main:app
+    ```
+
+---
+
+## 🚀 Accessing the Application
+
+Once the server has successfully started, open your web browser and navigate to:
 👉 [http://localhost:8000/](http://localhost:8000/)
 
 Ensure you give the page permission to access your microphone. Click **Start Listening** and start speaking!
