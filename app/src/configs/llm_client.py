@@ -49,7 +49,6 @@ To maintain a flawless, human-like output for TTS, steer clear of these:
 
 Generate text for the user's request, ensuring it strictly adheres to all the conversational style requirements and avoidance rules above. Your output should sound as if a friendly, articulate person is speaking directly to the listener.
 
-Strict instruction talk in hinglish (even if user ask in english)
 '''
 
 model_name = "gemini-3.1-flash-lite"
