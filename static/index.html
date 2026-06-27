@@ -463,9 +463,9 @@
     }
 
     button.btn-mic.active {
-      background: var(--accent-green);
+      background: #dc2626;
       color: white;
-      box-shadow: 0 4px 15px var(--accent-green-glow);
+      box-shadow: 0 4px 15px rgba(220, 38, 38, 0.4);
       border-color: transparent;
     }
 
@@ -490,6 +490,58 @@
 
     ::-webkit-scrollbar-thumb:hover {
       background: rgba(255, 255, 255, 0.2);
+    }
+
+    /* Latency Monitor Styles */
+    .latency-monitor {
+      margin-top: 15px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .latency-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+
+    .latency-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 10px 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      transition: all 0.3s ease;
+      align-items: center;
+      text-align: center;
+    }
+
+    .latency-card.highlight {
+      background: rgba(139, 92, 246, 0.08);
+      border-color: rgba(139, 92, 246, 0.25);
+      grid-column: span 2;
+    }
+
+    .latency-label {
+      font-size: 10px;
+      color: var(--text-muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .latency-value {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+
+    .latency-card.highlight .latency-value {
+      color: #a78bfa;
+      font-size: 18px;
     }
   </style>
 </head>
@@ -554,10 +606,33 @@
         <input type="range" id="volumeSlider" min="0" max="100" value="100" />
       </div>
 
+      <!-- Latency Monitor -->
+      <div class="latency-monitor">
+        <div class="section-title">Latency Monitor</div>
+        <div class="latency-grid">
+          <div class="latency-card">
+            <span class="latency-label">ASR (Transcribe)</span>
+            <span id="asrLatency" class="latency-value">-- ms</span>
+          </div>
+          <div class="latency-card">
+            <span class="latency-label">LLM (Gemini TTFT)</span>
+            <span id="llmLatency" class="latency-value">-- ms</span>
+          </div>
+          <div class="latency-card">
+            <span class="latency-label">TTS (Kokoro TTFA)</span>
+            <span id="ttsLatency" class="latency-value">-- ms</span>
+          </div>
+          <div class="latency-card highlight">
+            <span class="latency-label">Total Processing</span>
+            <span id="totalLatency" class="latency-value">-- ms</span>
+          </div>
+        </div>
+      </div>
+
       <!-- Action Buttons -->
       <div class="action-buttons">
         <button id="connectBtn" class="btn-primary btn-connect">Connect Agent</button>
-        <button id="micBtn" class="btn-primary btn-mic" disabled>Start Listening</button>
+        <button id="micBtn" class="btn-primary btn-mic" disabled>Start Call</button>
       </div>
     </div>
 
@@ -707,12 +782,12 @@
     micBtn.addEventListener('click', async () => {
       if (isRecording) {
         stopRecording();
-        micBtn.textContent = 'Start Listening';
+        micBtn.textContent = 'Start Call';
         micBtn.classList.remove('active');
         setOrbState('idle');
       } else {
         await startRecording();
-        micBtn.textContent = 'Stop Listening';
+        micBtn.textContent = 'Cut Call';
         micBtn.classList.add('active');
         setOrbState('listening');
       }
@@ -785,6 +860,7 @@
           statusText.textContent = 'Connected (Ready)';
           setOrbState('idle');
           sendSettings(); // sync settings on connection
+          resetLatencyDisplay();
           appendMessage('agent', 'Connected successfully! Ready to converse.');
         };
 
@@ -824,6 +900,13 @@
                 appendMessage('agent', `Error: ${data.text}`);
                 setOrbState('idle');
                 statusText.textContent = 'Error occurred';
+              } else if (data.type === 'latency_metrics') {
+                try {
+                  const metrics = JSON.parse(data.text);
+                  updateLatencyDisplay(metrics);
+                } catch (err) {
+                  console.error("Error parsing latency metrics:", err);
+                }
               }
             } catch (e) {
               console.error('JSON parse error:', e);
@@ -857,12 +940,13 @@
         stopRecording();
       }
       stopAudioPlayback();
+      resetLatencyDisplay();
 
       isConnected = false;
       connectBtn.textContent = 'Connect Agent';
       connectBtn.classList.remove('connected');
       micBtn.disabled = true;
-      micBtn.textContent = 'Start Listening';
+      micBtn.textContent = 'Start Call';
       micBtn.classList.remove('active');
       statusText.textContent = 'Disconnected';
       setOrbState('idle');
@@ -1217,6 +1301,7 @@
         interimBubble.remove();
       }
       appendMessage('user', text || "(Silence)");
+      resetLatencyDisplay();
     }
 
     function appendOrUpdateAgentResponse(text) {
@@ -1228,6 +1313,46 @@
         appendMessage('agent', text);
       }
       chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+
+    // --- Latency Monitor Helpers ---
+    function updateLatencyDisplay(metrics) {
+      const asrEl = document.getElementById('asrLatency');
+      const llmEl = document.getElementById('llmLatency');
+      const ttsEl = document.getElementById('ttsLatency');
+      const totalEl = document.getElementById('totalLatency');
+      
+      if (asrEl) asrEl.textContent = metrics.asr_ms + ' ms';
+      if (llmEl) llmEl.textContent = metrics.llm_ms + ' ms';
+      if (ttsEl) ttsEl.textContent = metrics.tts_ms + ' ms';
+      if (totalEl) totalEl.textContent = metrics.total_ms + ' ms';
+
+      if (asrEl) setLatencyColor(asrEl, metrics.asr_ms, 200, 500);
+      if (llmEl) setLatencyColor(llmEl, metrics.llm_ms, 300, 600);
+      if (ttsEl) setLatencyColor(ttsEl, metrics.tts_ms, 200, 400);
+      if (totalEl) setLatencyColor(totalEl, metrics.total_ms, 600, 1200);
+    }
+
+    function setLatencyColor(element, value, goodThreshold, fairThreshold) {
+      if (value <= goodThreshold) {
+        element.style.color = '#10b981'; // Green
+      } else if (value <= fairThreshold) {
+        element.style.color = '#f59e0b'; // Amber
+      } else {
+        element.style.color = '#ef4444'; // Red
+      }
+    }
+
+    function resetLatencyDisplay() {
+      const asrEl = document.getElementById('asrLatency');
+      const llmEl = document.getElementById('llmLatency');
+      const ttsEl = document.getElementById('ttsLatency');
+      const totalEl = document.getElementById('totalLatency');
+      
+      if (asrEl) { asrEl.textContent = '-- ms'; asrEl.style.color = ''; }
+      if (llmEl) { llmEl.textContent = '-- ms'; llmEl.style.color = ''; }
+      if (ttsEl) { ttsEl.textContent = '-- ms'; ttsEl.style.color = ''; }
+      if (totalEl) { totalEl.textContent = '-- ms'; totalEl.style.color = ''; }
     }
 
     // Resume AudioContext in case of browser security locks

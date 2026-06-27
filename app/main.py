@@ -3,99 +3,91 @@ import json
 import logging
 import io
 import time
-from typing import Optional
+from collections import deque
 
-import torch
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-import torchaudio
 
-from sherpa_onnx import OnlineRecognizer
-from kokoro import KPipeline, KModel
+# Preload CUDA libraries from virtualenv before loading ASR/TTS engines
+from src.utils import preload_cuda_libraries
+preload_cuda_libraries()
 
 from src.configs.connections import ConnectionManager
-from src.utils import bytes_to_audio, get_normalized_audio_energy
+from src.utils import bytes_to_audio, get_normalized_audio_energy, extract_sentences, ensure_models_exist
 from src.transcription.voice_activity_detection import is_speech
+from src.transcription import StreamingASR
+from src.speech_generation import TTSManager
 from src.configs import conversation_gen_model
 
-from collections import deque
-
 # Logging setup
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s - %(lineno)d - %(funcName)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s - %(lineno)d - %(funcName)s'
+)
 logger = logging.getLogger(__name__)
-AUDIO_ENERGY_SPEAKING_THRESHOLD = 0.008
+
 # FastAPI app setup
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Globals
-recognizer_en: OnlineRecognizer = None
-device = "cuda" if torch.cuda.is_available() else "cpu"
-manager = None
-pipeline = None
+# Globals (Managers initialized on startup)
+asr_manager: StreamingASR = None
+tts_manager: TTSManager = None
+manager: ConnectionManager = None
+
 VAD_SAMPLE_RATE = 16000
-
-async def load_asr_model():
-    """Load the ASR model in memory"""
-    global recognizer_en
-    logger.info("Loading ASR model...")
-    try:
-        recognizer_en = OnlineRecognizer.from_transducer(
-            tokens="./models/Kroko-Streaming-ASR-Python/en_tokens.txt",
-            encoder="./models/Kroko-Streaming-ASR-Python/en_encoder.onnx",
-            decoder="./models/Kroko-Streaming-ASR-Python/en_decoder.onnx",
-            joiner="./models/Kroko-Streaming-ASR-Python/en_joiner.onnx",
-            num_threads=5,
-            decoding_method="modified_beam_search",
-            debug=False,
-            provider="cuda",
-            device=0,
-        )
-    except Exception as e:
-        logger.error(f"Failed to load ASR model: {e}")
-        raise
-
-async def load_tts_model():
-    """Load the TTS model in memory"""
-    global pipeline
-    model = KModel(
-        config="./models/Kroko-82M/config.json",
-        model="./models/Kroko-82M/kokoro-v1_0.pth",
-    ).to('cuda')
-    pipeline = KPipeline(lang_code="a", model=model, device='cuda')
 
 @app.on_event("startup")
 async def startup_event():
-    await load_asr_model()
-    await load_tts_model()
-    global manager
+    """Load models and connection manager on startup"""
+    global asr_manager, tts_manager, manager
+    
+    # Ensure all required models exist before loading
+    ensure_models_exist()
+    
+    # Initialize ASR
+    asr_manager = StreamingASR(
+        tokens_path="./models/Kroko-Streaming-ASR-Python/en_tokens.txt",
+        encoder_path="./models/Kroko-Streaming-ASR-Python/en_encoder.onnx",
+        decoder_path="./models/Kroko-Streaming-ASR-Python/en_decoder.onnx",
+        joiner_path="./models/Kroko-Streaming-ASR-Python/en_joiner.onnx",
+        num_threads=5,
+        decoding_method="modified_beam_search",
+        debug=False,
+        provider="cpu",
+        device=0,
+    )
+    
+    # Initialize TTS
+    tts_manager = TTSManager(
+        model_path="./models/Kroko-82M/kokoro-v1.0.onnx",
+        voices_path="./models/Kroko-82M/voices-v1.0.bin"
+    )
+    
+    # Initialize connection manager
     manager = ConnectionManager()
 
-import re
-
-def extract_sentences(text: str):
+async def generate_and_send_response(
+    websocket: WebSocket,
+    prompt: str,
+    voice: str,
+    tts_mgr: TTSManager,
+    conn_mgr: ConnectionManager,
+    speech_end_time: float,
+    asr_done_time: float,
+    conversation_history: list
+):
     """
-    Splits text into sentences. Returns a list of complete sentences
-    and the remaining unfinished text.
+    Asynchronously triggers response generation from Gemini, splits the text stream 
+    into sentences, runs speech generation (TTS) on each sentence, and streams audio to client.
     """
-    # Matches sentences ending in ., ?, !, or a newline
-    pattern = re.compile(r'([^.!?\n]+[.!?\n]+)')
-    matches = pattern.findall(text)
-    
-    if not matches:
-        return [], text
-        
-    matched_len = sum(len(m) for m in matches)
-    remainder = text[matched_len:]
-    
-    return [m.strip() for m in matches if m.strip()], remainder
-
-async def generate_and_send_response(websocket: WebSocket, prompt: str, voice: str, pipeline, manager):
+    ai_response_text = ""
+    ai_response_appended = False
     try:
-        await manager.send_message(websocket, "audio_start", "Audio incoming...")
+        await conn_mgr.send_message(websocket, "audio_start", "Audio incoming...")
         
         # Start Gemini API call asynchronously with streaming
         response = await conversation_gen_model.generate_content_async(prompt, stream=True)
@@ -103,53 +95,102 @@ async def generate_and_send_response(websocket: WebSocket, prompt: str, voice: s
         text_buffer = ""
         loop = asyncio.get_running_loop()
         
+        first_token_time = None
+        first_audio_sent_time = None
+        
         async for chunk in response:
             try:
                 if chunk.text:
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                        
                     text_buffer += chunk.text
+                    ai_response_text += chunk.text
                     sentences, text_buffer = extract_sentences(text_buffer)
                     for sentence in sentences:
                         logger.info(f"Generated sentence: {sentence}")
-                        await manager.send_message(websocket, "llm_response_chunk", sentence)
+                        await conn_mgr.send_message(websocket, "llm_response_chunk", sentence)
                         
-                        def run_tts(text_to_speak, v_name):
-                            return list(pipeline(text_to_speak, voice=v_name))
-                        
-                        # Generate audio for the sentence in thread pool
-                        tts_results = await loop.run_in_executor(None, run_tts, sentence, voice)
+                        # Generate audio for the sentence in the thread pool using TTSManager
+                        tts_results = await loop.run_in_executor(
+                            None, tts_mgr.generate_speech, sentence, voice
+                        )
                         for gs, ps, audio in tts_results:
                             await asyncio.sleep(0)
                             buf = io.BytesIO()
                             sf.write(buf, audio, 24000, format='WAV')
                             buf.seek(0)
+                            
+                            if first_audio_sent_time is None:
+                                first_audio_sent_time = time.time()
+                                asr_ms = int((asr_done_time - speech_end_time) * 1000)
+                                llm_ms = int((first_token_time - asr_done_time) * 1000)
+                                tts_ms = int((first_audio_sent_time - first_token_time) * 1000)
+                                total_ms = int((first_audio_sent_time - speech_end_time) * 1000)
+                                
+                                metrics = {
+                                    "asr_ms": asr_ms,
+                                    "llm_ms": llm_ms,
+                                    "tts_ms": tts_ms,
+                                    "total_ms": total_ms
+                                }
+                                await conn_mgr.send_message(websocket, "latency_metrics", json.dumps(metrics))
+                            
                             await websocket.send_bytes(buf.read())
             except Exception as inner_e:
                 logger.error(f"Error processing text chunk: {inner_e}")
                 
-        # Send remaining text
+        # Send remaining text in buffer
         if text_buffer.strip():
             sentence = text_buffer.strip()
             logger.info(f"Generated final sentence: {sentence}")
-            await manager.send_message(websocket, "llm_response_chunk", sentence)
+            await conn_mgr.send_message(websocket, "llm_response_chunk", sentence)
             
-            def run_tts(text_to_speak, v_name):
-                return list(pipeline(text_to_speak, voice=v_name))
-                
-            tts_results = await loop.run_in_executor(None, run_tts, sentence, voice)
+            tts_results = await loop.run_in_executor(
+                None, tts_mgr.generate_speech, sentence, voice
+            )
             for gs, ps, audio in tts_results:
                 await asyncio.sleep(0)
                 buf = io.BytesIO()
                 sf.write(buf, audio, 24000, format='WAV')
                 buf.seek(0)
+                
+                if first_audio_sent_time is None:
+                    first_audio_sent_time = time.time()
+                    if first_token_time is None:
+                        first_token_time = first_audio_sent_time
+                    asr_ms = int((asr_done_time - speech_end_time) * 1000)
+                    llm_ms = int((first_token_time - asr_done_time) * 1000)
+                    tts_ms = int((first_audio_sent_time - first_token_time) * 1000)
+                    total_ms = int((first_audio_sent_time - speech_end_time) * 1000)
+                    
+                    metrics = {
+                        "asr_ms": asr_ms,
+                        "llm_ms": llm_ms,
+                        "tts_ms": tts_ms,
+                        "total_ms": total_ms
+                    }
+                    await conn_mgr.send_message(websocket, "latency_metrics", json.dumps(metrics))
+                    
                 await websocket.send_bytes(buf.read())
                 
-        await manager.send_message(websocket, "audio_end", "Done playing audio")
+        await conn_mgr.send_message(websocket, "audio_end", "Done playing audio")
+        
+        # Append completed AI response to conversation history
+        if not ai_response_appended and ai_response_text.strip():
+            conversation_history.append({"role": "ai", "text": ai_response_text.strip()})
+            ai_response_appended = True
+            
     except asyncio.CancelledError:
         logger.info("AI response streaming task received cancellation signal.")
-        await manager.send_message(websocket, "audio_stop", "Playback stopped.")
+        await conn_mgr.send_message(websocket, "audio_stop", "Playback stopped.")
+        # Append partial AI response to conversation history on user interruption
+        if not ai_response_appended and ai_response_text.strip():
+            conversation_history.append({"role": "ai", "text": ai_response_text.strip()})
+            ai_response_appended = True
     except Exception as e:
         logger.error(f"Error in generate_and_send_response: {e}")
-        await manager.send_message(websocket, "error", f"Response error: {str(e)}")
+        await conn_mgr.send_message(websocket, "error", f"Response error: {str(e)}")
 
 @app.websocket("/ws/audio")
 async def websocket_audio_endpoint(websocket: WebSocket):
@@ -161,6 +202,9 @@ async def websocket_audio_endpoint(websocket: WebSocket):
     silence_chunk_count = 0
     speaking_chunk_count = 0
     
+    # Store conversation history (last 10 messages)
+    conversation_history = []
+    
     # Default configs
     current_voice = "af_heart"
     max_allowed_silence = 8    # ~1 sec at 128ms per chunk
@@ -170,14 +214,12 @@ async def websocket_audio_endpoint(websocket: WebSocket):
     
     ai_response_task = None
     ai_response_start_time = 0.0
-    barge_in_consecutive_chunks = 0
 
     POST_SPEECH_BUFFER_CHUNKS = 10
     post_speech_buffer = deque(maxlen=POST_SPEECH_BUFFER_CHUNKS)
 
     try:
         while True:
-            # We receive websocket message (which can be bytes or text)
             message = await websocket.receive()
             
             if "bytes" in message:
@@ -185,11 +227,10 @@ async def websocket_audio_endpoint(websocket: WebSocket):
                 post_speech_buffer.append(raw_audio)
                 
                 audio_np = np.frombuffer(raw_audio, dtype=np.int16)
-                # No resampling needed since client streams 16kHz natively
                 resampled_audio = audio_np
                 
-                # VAD framing
-                VAD_FRAME_SIZE_MS = 30 # ms
+                # VAD framing (30ms frames)
+                VAD_FRAME_SIZE_MS = 30
                 vad_frame_size_samples = int(VAD_SAMPLE_RATE * VAD_FRAME_SIZE_MS / 1000)
 
                 webrtcvad_speech_detected = False
@@ -207,38 +248,30 @@ async def websocket_audio_endpoint(websocket: WebSocket):
                 audio_energy = get_normalized_audio_energy(raw_audio)
                 speech_detected = webrtcvad_speech_detected or (audio_energy > audio_energy_speaking_threshold)
                 
-                # Diagnostic log to see what is keeping the mic active
-                logger.info(f"VAD: {webrtcvad_speech_detected} | Energy: {audio_energy:.4f} (threshold: {audio_energy_speaking_threshold}) | Speech Detected: {speech_detected}")
+                logger.info(
+                    f"VAD: {webrtcvad_speech_detected} | "
+                    f"Energy: {audio_energy:.4f} (threshold: {audio_energy_speaking_threshold}) | "
+                    f"Speech Detected: {speech_detected}"
+                )
 
                 if speech_detected:
-                    # User is speaking.
-                    # Note: Interruption (barge-in) is controlled by the client-side VAD,
-                    # which sends a "user_interrupted" text message to cancel the task.
-                    # This avoids false triggers due to network jitter or echo on the backend.
-                    
                     user_is_speaking = True
                     silence_chunk_count = 0
                     speaking_chunk_count += 1
                     
                     if stream_state is None:
-                        stream_state = recognizer_en.create_stream()
+                        stream_state = asr_manager.create_stream()
                     
-                    audio_np_asr, _ = bytes_to_audio(raw_audio, sample_rate=16000)
-                    stream_state.accept_waveform(16000, audio_np_asr.tolist())
-                    
-                    while recognizer_en.is_ready(stream_state):
-                        recognizer_en.decode_streams([stream_state])
-                    
-                    interim_text = recognizer_en.get_result(stream_state)
+                    interim_text = asr_manager.process_chunk(stream_state, raw_audio)
                     if interim_text:
                         await manager.send_message(websocket, "interim_transcription", interim_text)
 
                 else:
-                    barge_in_consecutive_chunks = 0
                     if user_is_speaking:
                         silence_chunk_count += 1
                         if silence_chunk_count > max_allowed_silence:
                             user_is_speaking = False
+                            speech_end_time = time.time()
                             
                             if speaking_chunk_count < min_allowed_speaking:
                                 logger.info(f"Utterance too short ({speaking_chunk_count} chunks). Discarding.")
@@ -249,27 +282,42 @@ async def websocket_audio_endpoint(websocket: WebSocket):
 
                             speaking_chunk_count = 0
                             if stream_state:
-                                # Feed the post-speech buffer to ASR
-                                for buffered_chunk in post_speech_buffer:
-                                    audio_np_asr, _ = bytes_to_audio(buffered_chunk, sample_rate=16000)
-                                    stream_state.accept_waveform(16000, audio_np_asr.tolist())
+                                # Finalize transcription using ASR manager
+                                final_transcription = asr_manager.finalize_stream(
+                                    stream_state, post_speech_buffer
+                                )
                                 post_speech_buffer.clear()
-
-                                stream_state.input_finished()
-                                while recognizer_en.is_ready(stream_state):
-                                    recognizer_en.decode_streams([stream_state])
-                                
-                                final_transcription = recognizer_en.get_result(stream_state)
+                                asr_done_time = time.time()
                                 await manager.send_message(websocket, "transcription", final_transcription)
 
                                 if final_transcription:
-                                    prompt = f"User: {final_transcription}\nAI:"
+                                    # Append user query to history
+                                    conversation_history.append({"role": "user", "text": final_transcription})
+                                    
+                                    # Limit history size to the last 10 messages (approx 5 conversation turns)
+                                    while len(conversation_history) > 10:
+                                        conversation_history.pop(0)
+                                        
+                                    # Construct prompt with historical context
+                                    prompt = ""
+                                    for msg in conversation_history:
+                                        role_label = "User" if msg["role"] == "user" else "AI"
+                                        prompt += f"{role_label}: {msg['text']}\n"
+                                    prompt += "AI:"
+                                    
                                     if ai_response_task and not ai_response_task.done():
                                         ai_response_task.cancel()
                                     
                                     ai_response_task = asyncio.create_task(
                                         generate_and_send_response(
-                                            websocket, prompt, current_voice, pipeline, manager
+                                            websocket,
+                                            prompt,
+                                            current_voice,
+                                            tts_manager,
+                                            manager,
+                                            speech_end_time,
+                                            asr_done_time,
+                                            conversation_history
                                         )
                                     )
                                     ai_response_start_time = time.time()
@@ -315,6 +363,6 @@ async def websocket_audio_endpoint(websocket: WebSocket):
 
 @app.get("/")
 async def get():
-    with open("static/index_speech_to_text.html", "r") as f:
+    with open("static/index.html", "r") as f:
         html_content = f.read()
     return HTMLResponse(content=html_content)
